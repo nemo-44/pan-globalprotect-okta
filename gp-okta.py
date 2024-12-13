@@ -3,7 +3,7 @@
 """
    The MIT License (MIT)
 
-   Copyright (C) 2018-2020 Andris Raugulis (moo@arthepsy.eu)
+   Copyright (C) 2018-2023 Andris Raugulis (moo@arthepsy.eu)
    Copyright (C) 2018 Nick Lanham (nick@afternight.org)
    Copyright (C) 2019 Aaron Lindsay (aclindsa@gmail.com)
    Copyright (C) 2019 Taylor Dean (taylor@makeshift.dev)
@@ -236,7 +236,7 @@ class Conf(object):
 		return v.lower() in ['1', 'true']
 
 	def add_cert(self, cert, name='unknown'):
-		# type: (str, str) -> None
+		# type: (Union[binary_type, text_type], str) -> None
 		if not cert:
 			return
 		if name in ['vpn_cli', 'okta_cli', 'okta_url']:
@@ -467,7 +467,7 @@ def paloalto_prelogin(conf, gateway_url=None):
 	return saml_xml
 
 def okta_saml(conf, saml_xml):
-	# type: (Conf, str) -> str
+	# type: (Conf, str) -> Tuple[str, str]
 	log('okta saml request [okta_url]')
 	url, data = parse_form(saml_xml)
 	dbg_form(conf, 'okta.saml request', data)
@@ -478,7 +478,7 @@ def okta_saml(conf, saml_xml):
 	return c, redirect_url
 
 def okta_auth(conf, stateToken=None):
-	# type: (Conf, Optional[str]) -> Any
+	# type: (Conf, Optional[str]) -> str
 	log('okta auth request [okta_url]')
 	url = '{0}/api/v1/authn'.format(conf.okta_url)
 	data = {
@@ -493,13 +493,13 @@ def okta_auth(conf, stateToken=None):
 	}
 	_, _h, j = send_json_req(conf, 'okta', 'auth', url, data)
 	while True:
-		ok, r = okta_transaction_state(conf, j)
+		ok, t, r = okta_transaction_state(conf, j)
 		if ok:
-			return r
+			return t
 		j = r
 
 def okta_transaction_state(conf, j):
-	# type: (Conf, Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]
+	# type: (Conf, Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]
 	# https://developer.okta.com/docs/api/resources/authn#transaction-state
 	status = j.get('status', '').strip().lower()
 	dbg(conf.debug, 'status', status)
@@ -515,7 +515,7 @@ def okta_transaction_state(conf, j):
 			err('empty state token')
 		data = {'stateToken': state_token}
 		_, _h, j = send_json_req(conf, 'okta', 'skip', url, data, expected_url=conf.okta_url)
-		return False, j
+		return False, '', j
 	# status: password_expired
 	# status: recovery
 	# status: recovery_challenge
@@ -526,7 +526,7 @@ def okta_transaction_state(conf, j):
 	# status: mfa_required
 	if status == 'mfa_required':
 		j = okta_mfa(conf, j)
-		return False, j
+		return False, '', j
 	# status: mfa_challenge
 	# status: success
 	if status != 'success':
@@ -535,7 +535,7 @@ def okta_transaction_state(conf, j):
 	session_token = j.get('sessionToken', '').strip()
 	if not session_token:
 		err('empty session token')
-	return True, session_token
+	return True, session_token, j
 
 def okta_mfa(conf, j):
 	# type: (Conf, Dict[str, Any]) -> Dict[str, Any]
@@ -816,14 +816,33 @@ def okta_oie_parse_response(conf, j):
 		err('remediation in response is not array')
 	return state_handle, rem
 
+def okta_oie_response_error(msg, j=None, rem=None):
+	emsg = msg
+	if j is not None:
+		for jmv in j.get('messages', {}).get('value', []):
+			m = jmv.get('message', '')
+			if not m: continue
+			emsg += '\n\tmessage: ' + m
+	if rem is not None:
+		rem_names = []
+		for jrv in rem.get('value', []):
+			name = jrv.get('name', '')
+			if not name: continue
+			rem_names.append(name)
+		if len(rem_names) > 0:
+			emsg += '\n\t' + 'remediations: ' + ', '.join(rem_names)
+	err(emsg)
+
 def okta_oie_response_lookup(j, sk, k, v):
 	for sj in j.get(sk, []):
 		if sj.get(k) == v:
-			return sj
-	err('no "{0}" found as "{1}" in "{2}" items'.format(v, k, sk))
+			return True, sj
+	return False, 'no "{0}" found as "{1}" in "{2}" items'.format(v, k, sk)
 
 def okta_oie_mfa_password(conf, state_handle, mfa, rem):
-	rem_ca = okta_oie_response_lookup(rem, 'value', 'name', 'challenge-authenticator')
+	ok, rem_ca = okta_oie_response_lookup(rem, 'value', 'name', 'challenge-authenticator')
+	if not ok:
+		okta_oie_response_error(rem_ca, None, rem)
 	log('mfa password request')
 	data = {'stateHandle': state_handle, 'credentials':{'passcode': conf.password}}
 	url = '{0}/idp/idx/challenge/answer'.format(conf.okta_url)
@@ -831,7 +850,9 @@ def okta_oie_mfa_password(conf, state_handle, mfa, rem):
 	return okta_oie_identify_parse(conf, state_handle, j)
 
 def okta_oie_mfa_totp(conf, state_handle, mfa, rem):
-	rem_ca = okta_oie_response_lookup(rem, 'value', 'name', 'challenge-authenticator')
+	ok, rem_ca = okta_oie_response_lookup(rem, 'value', 'name', 'challenge-authenticator')
+	if not ok:
+		okta_oie_response_error(rem_ca, None, rem)
 	provider = mfa.get('provider', '')
 	secret = conf.get_value('totp.{0}'.format(provider))
 	code = None
@@ -852,7 +873,9 @@ def okta_oie_mfa_totp(conf, state_handle, mfa, rem):
 	return okta_oie_identify_parse(conf, state_handle, j)
 
 def okta_oie_mfa_push(conf, state_handle, mfa, rem):
-	rem_cp = okta_oie_response_lookup(rem, 'value', 'name', 'challenge-poll')
+	ok, rem_cp = okta_oie_response_lookup(rem, 'value', 'name', 'challenge-poll')
+	if not ok:
+		okta_oie_response_error(rem_cp, None, rem)
 	c = 0
 	while True:
 		if c > 10:
@@ -869,7 +892,9 @@ def okta_oie_mfa_push(conf, state_handle, mfa, rem):
 		c += 1
 
 def okta_oie_mfa_sms(conf, state_handle, mfa, rem):
-	rem_ca = okta_oie_response_lookup(rem, 'value', 'name', 'challenge-authenticator')
+	ok, rem_ca = okta_oie_response_lookup(rem, 'value', 'name', 'challenge-authenticator')
+	if not ok:
+		okta_oie_response_error(rem_ca, None, rem)
 	code = input('SMS verification code: ').strip()
 	log('mfa sms request: {0} [okta_url]'.format(code))
 	data = {'stateHandle': state_handle, 'credentials':{'passcode': code}}
@@ -918,8 +943,38 @@ def okta_oie_identify_parse(conf, state_handle, j):
 		rurl = success.get('href')
 		return rurl
 	state_handle, rem = okta_oie_parse_response(conf, j)
-	rem_saa = okta_oie_response_lookup(rem, 'value', 'name', 'select-authenticator-authenticate')
-	rem_saa_a = okta_oie_response_lookup(rem_saa, 'value', 'name', 'authenticator')
+	ok, rem_saa = okta_oie_response_lookup(rem, 'value', 'name', 'select-authenticator-authenticate')
+	if not ok:
+		is_expiring = False
+		msgs = j.get('messages', {}).get('value', [])
+		if len(msgs) > 0:
+			for jm in msgs:
+				if jm.get('i18n', {}).get('key', '') == 'idx.password.expiring.message':
+					is_expiring = True
+					break
+				if 'password expires' in jm.get('message', ''):
+					is_expiring = True
+					break
+		rem_names = []
+		can_skip = False 
+		for jremv in rem.get('value', []):
+			rem_name = jremv.get('name', '')
+			rem_names.append(rem_name)
+			if rem_name == 'skip':
+				can_skip = True
+		if is_expiring:
+			warn('Password expiring soon')
+			if can_skip:
+				data = {'stateHandle': state_handle}
+				url = '{0}/idp/idx/skip'.format(conf.okta_url)
+				_, h, j = send_json_req(conf, 'okta', 'idp/idx/skip', url, data)
+				return okta_oie_identify_parse(conf, state_handle, j)
+		if rem_names == ['reenroll-authenticator']:
+			warn('Password most probably expired')
+		okta_oie_response_error(rem_saa, j, rem)
+	ok, rem_saa_a = okta_oie_response_lookup(rem_saa, 'value', 'name', 'authenticator')
+	if not ok:
+		okta_oie_response_error(rem_saa_a, j, rem)
 
 	mfas = []
 	for aopt in rem_saa_a.get('options'):
@@ -941,7 +996,9 @@ def okta_oie_identify_parse(conf, state_handle, j):
 					mfa_eid = fi.get('value')
 				else:
 					err('unknown mfa required field: {0}'.format(fi_name))
-		aopt_mto = aopt_idv = amt = okta_oie_response_lookup(aopt_form, 'value', 'name', 'methodType')
+		ok, aopt_mto = okta_oie_response_lookup(aopt_form, 'value', 'name', 'methodType')
+		if not ok:
+			okta_oie_response_error(aopt_mto, None, None)
 		mfa_mts = []
 		if aopt_mto.get('value'):
 				mfa_mts.append(aopt_mto.get('value'))
@@ -992,9 +1049,9 @@ def okta_oie_identify_parse(conf, state_handle, j):
 	return r
 
 def okta_oie(conf, state_token, gw_url):
-	# type: (Conf, str) -> Tuple[str, str]
+	# type: (Conf, Optional[str], Optional[str]) -> Tuple[str, str]
 	if not state_token:
-		return None, None
+		err('okta oie: no state token')
 	url = '{0}/idp/idx/introspect'.format(conf.okta_url)
 	data = {'stateToken': state_token}
 	_, h, j = send_json_req(conf, 'okta', 'idp/idx/introspect', url, data)
@@ -1027,7 +1084,7 @@ def okta_oie(conf, state_token, gw_url):
 		saml_slo = h.get('saml-slo', '').strip()
 		dbg(conf.debug, 'saml prop', [saml_auth_status, saml_slo])
 		return saml_username, prelogin_cookie
-	return None, None
+	err('okta oie: username or cookie empty')
 
 def output_gateways(gateways):
 	# type: (Dict[str, str]) -> None
@@ -1130,7 +1187,7 @@ def read_conf(fp, gpg_decrypt, gpg_home):
 		err('config file "{0}" does not exist'.format(fp))
 	cc = ''
 	with io.open(fp, 'rb') as fh:
-		cc = fh.read()
+		cc = to_u(fh.read())
 	if fp.lower().endswith('.gpg') and not gpg_decrypt:
 		gpg_decrypt = True
 		log('conf file looks like gpg encrypted. trying decryption')
@@ -1143,7 +1200,7 @@ def read_conf(fp, gpg_decrypt, gpg_home):
 		dc = gpg.decrypt(cc)
 		if not dc.ok:
 			err('failed to decrypt config file. status: {0}, error:\n {1}'.format(dc.status, dc.stderr))
-		cc = dc.data
+		cc = to_u(dc.data)
 	return cc
 
 def main():
